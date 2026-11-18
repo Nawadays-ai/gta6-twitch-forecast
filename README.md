@@ -27,14 +27,22 @@ launches bundled in the case itself:
    in the UTC day (a single global unlock at 14:00Z, say), whose hour-1
    anchor means something entirely different — their peaks run to hundreds
    of times their first hour, a regime this contest's rolling
-   midnight-local console launches are not in. A guard checks the case's
-   own first hour against its pre-release history; if it is not at launch
-   scale, the full pool is used instead.
-3. **Size weighting.** Each pool member is weighted by a Gaussian kernel on
-   log hour-1 size (bandwidth 0.8), so launches of similar scale speak
-   loudest. The bandwidth widens automatically whenever the weighted pool
-   would otherwise collapse below eight effective members — a launch bigger
-   than every comparable must not rest on two or three neighbours.
+   midnight-local console launches are not in. (An earlier version also
+   gated the pool on the case's own hour-1 versus its pre-release history;
+   backtests showed that gate misfiring on established-franchise
+   categories, whose pre-release level is already high, so it was removed —
+   the pool choice now rests on the comparables' own profiles alone.)
+3. **Kernel weighting.** Each pool member is weighted by a Gaussian kernel
+   on two distances to the case: log hour-1 size (bandwidth 0.8), so
+   launches of similar scale speak loudest; and pre-release momentum —
+   `ln(median viewers of the last 12 pre-release hours / median of the 36
+   before them)`, bandwidth 1.75 — the window in which the first regional
+   midnight unlocks land, so it measures how far the rolling launch had
+   already travelled before the UTC day began. Launches whose momentum
+   matches the case's get a louder voice. The bandwidths widen together
+   automatically whenever the weighted pool would otherwise collapse below
+   eight effective members — a launch bigger than every comparable must
+   not rest on two or three neighbours.
 4. **Per-hour normal fit.** For each hour, the weighted mean of the
    log-ratios is the centre and the weighted standard deviation (floored at
    0.12, capped at 1.20) is the spread. Quantiles are
@@ -47,9 +55,15 @@ flat persistence with a slowly widening band, so the output is always valid.
 ## Validation
 
 Leave-one-out over the kit's comparables (each at-scale launch forecast from
-all the others, scored exactly as the contest scores): **0.203** mean
-pinball loss versus **0.265** for the flat persistence baseline — about 23%
-lower. Synthetic stress tests (levels rescaled ×0.05 and ×20, multiplicative
+all the others, scored exactly as the contest scores, with the target's own
+pre-release history in the case as a real case carries it): **0.197** mean
+pinball loss versus **0.265** for the flat persistence baseline — about 26%
+lower. (Under the same protocol the previous version of this entry scored
+0.213: the momentum weighting and the pool-gate removal account for the
+difference, and were adopted only after ablation against the alternatives —
+empirical quantiles, a hype-similarity kernel, a softened pool cutoff, and
+gap interpolation all measured neutral-to-worse and were rejected.)
+Synthetic stress tests (levels rescaled ×0.05 and ×20, multiplicative
 log noise, peaks shifted ±3 hours) keep the model at or near the baseline in
 the worst, deliberately out-of-regime cells and clearly ahead in-regime.
 Runtime is ~0.05 s per case; output is byte-for-byte deterministic.

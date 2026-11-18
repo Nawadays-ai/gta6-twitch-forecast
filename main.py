@@ -15,13 +15,18 @@ distribution per hour from the comparables whose own release days were
 already at scale in hour 1 (their hour-1 count at least 15% of their day's
 peak, which keeps out launches whose main unlock came later in the UTC day
 and whose hour-1 anchor means something entirely different), weighting each
-comparable by how close its hour-1 size is to this case's (a Gaussian kernel
-on log size, bandwidth 0.8), and fit a normal per hour: the weighted mean is
-the centre, the weighted standard deviation the spread. The forecast is
-q_tau(h) = p1 * exp(mu_h + z_tau * sigma_h). Constants (the 15% filter, the
-bandwidth, the spread floor and cap) were chosen by leave-one-out backtests
-over the comparables themselves, where this scores clearly below the flat
-persistence baseline; see FORECAST notes in the repository README.
+comparable by a Gaussian kernel on two distances to this case: its hour-1
+size (log size, bandwidth 0.8) and its pre-release momentum (how much its
+category's last 12 pre-release hours rose over the 36 before them, in log
+space, bandwidth 1.75 — the window in which the first regional midnight
+unlocks land, so it measures how far the rolling launch had already
+travelled before the UTC day began). We then fit a normal per hour: the
+weighted mean is the centre, the weighted standard deviation the spread.
+The forecast is q_tau(h) = p1 * exp(mu_h + z_tau * sigma_h). Constants (the
+15% filter, the bandwidths, the spread floor and cap) were chosen by
+leave-one-out backtests over the comparables themselves, where this scores
+clearly below the flat persistence baseline; see FORECAST notes in the
+repository README.
 
 Runs offline, standard library only, deterministic: the same case always
 produces the same bytes.
@@ -46,6 +51,16 @@ Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
 POOL_MIN_HOUR1_SHARE = 0.15
 # Gaussian kernel bandwidth on ln(hour-1 viewers) for pool weights.
 SIZE_BANDWIDTH = 0.8
+# Gaussian kernel bandwidth on pre-release momentum (log space) and the
+# momentum definition: ln(median viewers of the last MOM_LATE_HOURS before
+# the release day / median of the 36 hours before those), clamped to
+# +/-MOM_CLAMP because near-zero pre-release baselines of small categories
+# otherwise blow the ratio up. A comparable (or the case) whose pre-release
+# record is too thin simply gets no momentum factor (weight 1 for that
+# dimension), so the kernel degrades gracefully to size-only.
+MOM_BANDWIDTH = 1.75
+MOM_LATE_HOURS = 12
+MOM_CLAMP = 3.0
 # The per-hour log spread is kept inside this band: the floor stops a lucky
 # agreement among a few comparables from making the forecast overconfident,
 # the cap stops one wild hour from blowing the band open.
@@ -93,54 +108,91 @@ def release_day_curve(comp):
     return by_hour
 
 
-def shape_pool(case):
-    """Day curves of the comparables that can teach this case's shape.
-
-    Two pools are built: every usable curve, and the filtered pool of
-    already-at-scale launches. The filtered pool is used when it has enough
-    members and this case's own first hour is itself at launch scale (well
-    above the category's pre-release level in its history); otherwise the
-    full pool is the safer teacher.
-    """
-    curves = []
-    for comp in case.get("comparables") or []:
-        curve = release_day_curve(comp)
-        if len(curve) >= 12:
-            curves.append(curve)
-    filtered = []
-    for curve in curves:
-        peak = max(curve.values())
-        if peak > 0 and curve[1] / peak >= POOL_MIN_HOUR1_SHARE:
-            filtered.append(curve)
-    if len(filtered) >= MIN_POOL and case_is_at_scale(case):
-        return filtered
-    return curves
+def _median(vals):
+    s = sorted(vals)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
-def case_is_at_scale(case):
-    """True when hour 1 towers over the pre-release level in the history.
-
-    Guards the filtered pool: it describes launches that were already live
-    worldwide by 00:00 UTC. If this case's first hour is barely above its own
-    pre-release baseline, that profile does not fit and the full pool rules.
-    When the history cannot answer, assume the profile fits (the contest's
-    cases are rolling midnight-local console launches).
-    """
-    p1 = hour_one_viewers(case)
-    start = parse_ts(case["day_start"])
+def _pre_points(rows, start):
+    """Sorted (time, viewers) from raw hourly rows in [start-48h, start)."""
     pre = []
-    for row in case.get("history_hourly") or []:
+    for row in rows or []:
+        viewers = row.get("viewers")
+        if not viewers:
+            continue
         try:
             t = parse_ts(row["from"])
         except (KeyError, ValueError):
             continue
-        if start - timedelta(hours=48) <= t < start and row.get("viewers"):
-            pre.append(row["viewers"])
-    if len(pre) < 6:
-        return True
+        if start - timedelta(hours=48) <= t < start:
+            pre.append((t, viewers))
     pre.sort()
-    median_pre = pre[len(pre) // 2]
-    return p1 >= 3.0 * max(median_pre, 1)
+    return pre
+
+
+def _momentum(pre, start):
+    """Pre-release momentum from sorted pre-release points, or None.
+
+    ln(median of the last MOM_LATE_HOURS / median of the 36h before them).
+    The late window is where the first regional midnight unlocks land
+    (Europe's midnight is 23:00 UTC the day before), so this measures how
+    far a rolling launch had already travelled before the UTC day began.
+    Needs a minimally real record (>= 6 points, >= 3 on each side).
+    """
+    if len(pre) < 6:
+        return None
+    late = [v for t, v in pre if t >= start - timedelta(hours=MOM_LATE_HOURS)]
+    early = [v for t, v in pre if t < start - timedelta(hours=MOM_LATE_HOURS)]
+    if len(late) < 3 or len(early) < 3:
+        return None
+    mom = math.log(max(_median(late), 1.0) / max(_median(early), 1.0))
+    return min(MOM_CLAMP, max(-MOM_CLAMP, mom))
+
+
+def comparable_momentum(comp):
+    """A comparable's pre-release momentum, from its own hourly record."""
+    try:
+        start = parse_ts(comp["day_start"])
+    except (KeyError, ValueError):
+        return None
+    return _momentum(_pre_points(comp.get("hourly"), start), start)
+
+
+def case_momentum(case):
+    """This case's pre-release momentum, from its history_hourly."""
+    try:
+        start = parse_ts(case["day_start"])
+    except (KeyError, ValueError):
+        return None
+    return _momentum(_pre_points(case.get("history_hourly"), start), start)
+
+
+def shape_pool(case):
+    """(curve, momentum) pairs of the comparables that teach this case.
+
+    Two pools are built: every usable curve, and the filtered pool of
+    already-at-scale launches (hour 1 at least POOL_MIN_HOUR1_SHARE of the
+    day's peak). The filtered pool is used whenever it has enough members:
+    this contest's cases are documented rolling midnight-local launches,
+    and a case-side gate on the pre-release baseline was measured to
+    misfire on established-franchise categories (whose pre-release level
+    is already high) far more often than it could ever help here, so the
+    pool choice rests on the comparables' own profiles alone.
+    """
+    pool = []
+    for comp in case.get("comparables") or []:
+        curve = release_day_curve(comp)
+        if len(curve) >= 12:
+            pool.append((curve, comparable_momentum(comp)))
+    filtered = []
+    for curve, mom in pool:
+        peak = max(curve.values())
+        if peak > 0 and curve[1] / peak >= POOL_MIN_HOUR1_SHARE:
+            filtered.append((curve, mom))
+    if len(filtered) >= MIN_POOL:
+        return filtered
+    return pool
 
 
 def hour_one_viewers(case):
@@ -150,28 +202,38 @@ def hour_one_viewers(case):
     return 1.0
 
 
-def weighted_shape(curves, p1):
-    """{hour: (mu, sigma)} of ln(viewers_h / viewers_1), size-weighted.
+def weighted_shape(pool, p1, target_mom):
+    """{hour: (mu, sigma)} of ln(viewers_h / viewers_1), kernel-weighted.
 
-    The kernel bandwidth widens as needed so the weighted pool never
-    collapses onto a handful of members: when the case's hour-1 size sits
-    outside the pool's size range (a launch bigger than any comparable, say),
-    a fixed narrow kernel would rest the whole shape on two or three nearest
-    neighbours. The effective member count (sum w)^2 / sum(w^2) is kept at
-    or above MIN_EFFECTIVE_POOL by widening the band, up to a sane limit.
+    Each comparable is weighted by a Gaussian kernel on two distances to
+    this case: log hour-1 size, and pre-release momentum (the momentum
+    factor is 1 whenever either side's momentum is unknown, so the kernel
+    degrades gracefully to size-only). The bandwidths widen together as
+    needed so the weighted pool never collapses onto a handful of members:
+    when the case's hour-1 size sits outside the pool's size range (a
+    launch bigger than any comparable, say), a fixed narrow kernel would
+    rest the whole shape on two or three nearest neighbours. The effective
+    member count (sum w)^2 / sum(w^2) is kept at or above
+    MIN_EFFECTIVE_POOL by widening the bands, up to a sane limit.
     """
     log_p1 = math.log(p1)
-    log_sizes = [math.log(curve[1]) for curve in curves]
-    bandwidth = SIZE_BANDWIDTH
+    log_sizes = [math.log(curve[1]) for curve, _ in pool]
+    moms = [mom for _, mom in pool]
+    scale = 1.0
     weights = []
     for _ in range(8):
-        weights = [math.exp(-0.5 * ((ls - log_p1) / bandwidth) ** 2) for ls in log_sizes]
+        weights = []
+        for ls, mom in zip(log_sizes, moms):
+            w = math.exp(-0.5 * ((ls - log_p1) / (SIZE_BANDWIDTH * scale)) ** 2)
+            if mom is not None and target_mom is not None:
+                w *= math.exp(-0.5 * ((mom - target_mom) / (MOM_BANDWIDTH * scale)) ** 2)
+            weights.append(w)
         total = sum(weights)
         effective = total * total / sum(w * w for w in weights)
         if effective >= MIN_EFFECTIVE_POOL:
             break
-        bandwidth *= 1.5
-    weighted = [(curve, max(w, 1e-6)) for curve, w in zip(curves, weights)]
+        scale *= 1.5
+    weighted = [(curve, max(w, 1e-6)) for (curve, _), w in zip(pool, weights)]
     shape = {}
     for h in range(2, 25):
         pairs = [(math.log(curve[h] / curve[1]), w)
@@ -197,7 +259,7 @@ def forecast_case(case):
         raise ValueError("unexpected levels in case " + str(case.get("id")))
     p1 = hour_one_viewers(case)
     pool = shape_pool(case)
-    shape = weighted_shape(pool, p1) if pool else baseline_shape()
+    shape = weighted_shape(pool, p1, case_momentum(case)) if pool else baseline_shape()
     rows = []
     for row in case["forecast"]:
         h = row["hour"]
